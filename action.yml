@@ -1,0 +1,63 @@
+name: 'COPR to GitHub Release Action'
+description: 'Uploads COPR-generated RPM assets to GitHub Release based on a tag GitHub Action'
+branding:
+  icon: archive
+  color: blue
+inputs:
+  copr-owner-name:
+    description: 'COPR Owner Name'
+    required: true
+  copr-project-name:
+    description: 'COPR Project Name'
+    required: true
+  copr-package-name:
+    description: 'COPR Package Name'
+    required: true
+  tag-to-version-regex:
+    description: 'A regex that extracts and RPM version from the tag'
+    required: false
+    default: ""
+  tag:
+    description: 'Specific tag to process'
+    required: false
+    default: ""
+  fetch-tags:
+    description: 'Fetch local tags'
+    required: false
+    default: true
+  clobber-assets:
+    description: 'If a release already exists upload the assets anyway'
+    required: false
+    default: false
+  no-ignore-epoch:
+    description: 'Do consider RPM epoch in rpm version extraction and matching'
+    requried: false
+    default: false
+  wait-build:
+    description: 'If there are COPR builds running for the project, wait for them to complete before proceeding'
+    required: false
+    default: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install pre-requisites
+      run: pip install --break-system-packages --no-input requests
+    - name: Upload COPR results to GH Release assets
+      run: |
+        python copr-to-gh-release.py \
+        --copr-owner-name=${{ inputs.copr-owner-name }} \
+        --copr-project-name=${{ inputs.copr-project-name }} \
+        --copr-package-name=${{ inputs.copr-package-name}} \
+        ${{ inputs.tag-to-version-regex != ""  && "--tag-to-versoin-regex=" + inputs.tag-to-version-regex || "" }} \
+        ${{ inputs.tag != "" && "--tag" + inputs.tag || "" }} \
+        ${{ inputs.fetch-tags && "--fetch-tags" || "" }} \
+        ${{ inputs.clobber-assets && "--clobber-assets" || "" }} \
+        ${{ inputs.no-ignore-epoch && "--no-ignore-epoch" || "" }} \
+        ${{ inputs.wait-build && "--wait-build"  || "" }}
