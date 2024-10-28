@@ -10,7 +10,6 @@ from subprocess import check_output as run, check_call as exe, CalledProcessErro
 from time import sleep
 
 import requests
-from paramiko.proxy import subprocess
 
 parser = argparse.ArgumentParser(description="COPR to GH Release Synchronizer",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)

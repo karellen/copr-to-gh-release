@@ -48,16 +48,18 @@ runs:
       with:
         python-version: "3.12"
     - name: Install pre-requisites
+      shell: bash
       run: pip install --break-system-packages --no-input requests
     - name: Upload COPR results to GH Release assets
+      shell: bash
       run: |
-        python copr-to-gh-release.py \
+        python ${{ github.action_path }}/copr-to-gh-release.py \
         --copr-owner-name=${{ inputs.copr-owner-name }} \
         --copr-project-name=${{ inputs.copr-project-name }} \
         --copr-package-name=${{ inputs.copr-package-name}} \
-        ${{ inputs.tag-to-version-regex != ""  && "--tag-to-versoin-regex=" + inputs.tag-to-version-regex || "" }} \
-        ${{ inputs.tag != "" && "--tag" + inputs.tag || "" }} \
-        ${{ inputs.fetch-tags && "--fetch-tags" || "" }} \
-        ${{ inputs.clobber-assets && "--clobber-assets" || "" }} \
-        ${{ inputs.no-ignore-epoch && "--no-ignore-epoch" || "" }} \
-        ${{ inputs.wait-build && "--wait-build"  || "" }}
+        ${{ inputs.tag-to-version-regex != '' && format('--tag-to-version-re=''{0}''', inputs.tag-to-version-regex) || '' }} \
+        ${{ inputs.tag != '' && format('--tag={0}', inputs.tag) || '' }} \
+        ${{ inputs.fetch-tags && '--fetch-tags' || '' }} \
+        ${{ inputs.clobber-assets && '--clobber-assets' || '' }} \
+        ${{ inputs.no-ignore-epoch && '--no-ignore-epoch' || '' }} \
+        ${{ inputs.wait-build && '--wait-build'  || '' }}
