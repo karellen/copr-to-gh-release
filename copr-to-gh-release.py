@@ -159,7 +159,7 @@ def main():
                         version_files[k] = files
 
                 if fetch_tags:
-                    run(["git", "fetch", "--tags"])
+                    run(["git", "fetch", "--tags", "--force"])
 
                 def normalize_tag(tag):
                     if tag_to_version_re:
