@@ -215,7 +215,7 @@ def main():
                         exe(["gh", "release", "create", current_tag, "--verify-tag", "--generate-notes"], text=True)
 
                     if not release_found or clobber_assets:
-                        upload_files = set(get_files(rpm_version))
+                        upload_files = list(set(get_files(rpm_version)))
                         print(f"uploading files into release {current_tag}: {', '.join(map(basename, upload_files))}")
                         exe(["gh", "release", "upload", current_tag] + upload_files + ["--clobber"], text=True)
                     else:
