@@ -86,10 +86,10 @@ class FakeCopr:
         return False
 
 
-def build(build_id, version, chroots):
+def build(build_id, version, chroots, state="succeeded"):
     return {
         "id": build_id,
-        "state": "succeeded",
+        "state": state,
         "ended_on": build_id,
         "chroots": list(chroots),
         "repo_url": REPO_URL,
@@ -106,26 +106,45 @@ def rpm_result(version, arch):
     return {"name": "karellen-sysbox", "epoch": None, "version": ver, "release": rel, "arch": arch}
 
 
-class CoprSite:
-    """Builds the routes of a COPR project holding two builds: the tagged 0.7.1.8-1 and an older 0.7.1.5-1."""
+BUILD_LIST_URL = f"{COPR_API}/build/list?ownername=karellen&projectname=karellen-sysbox"
+PROJECT_URL = f"{COPR_API}/project?ownername=karellen&projectname=karellen-sysbox"
+NEW_BUILD_ID = 11181173
 
-    def __init__(self, chroot_states, pulp=True):
+
+class CoprSite:
+    """Routes of a COPR project holding the tagged 0.7.1.8-1 build, an older 0.7.1.5-1 build, and any added builds.
+
+    A build's state is "failed" if any of its chroots failed, as in COPR. The project's enabled chroots default to
+    every chroot of every build.
+    """
+
+    def __init__(self, chroot_states, pulp=True, project_chroots=None):
         self.routes = {}
         self.redirects = {}
         # URL -> number of requests that still see it as not yet published
         self.unpublished = {}
         self.pulp = pulp
-        old = build(11000001, "0.7.1.5-1", ["fedora-44-x86_64", "fedora-44-aarch64"])
-        new = build(11181173, "0.7.1.8-1", list(chroot_states))
-        self.routes[f"{COPR_API}/build/list?ownername=karellen&projectname=karellen-sysbox"] = json.dumps(
-            {"items": [old, new]}).encode()
-        for b, states in ((old, {c: "succeeded" for c in old["chroots"]}), (new, chroot_states)):
-            self.routes[b["source_package"]["url"]] = b"srpm"
-            self.routes[f"{COPR_API}/build-chroot/list/?build_id={b['id']}"] = json.dumps(
-                {"items": [{"name": c, "state": s} for c, s in states.items()]}).encode()
-            for chroot, state in states.items():
-                if state == "succeeded":
-                    self.add_chroot_results(b, chroot)
+        self.builds = []
+        self.project_chroots = project_chroots
+        self.add_build(11000001, "0.7.1.5-1", {"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "succeeded"})
+        self.add_build(NEW_BUILD_ID, "0.7.1.8-1", chroot_states)
+
+    def add_build(self, build_id, version, chroot_states):
+        state = "failed" if "failed" in chroot_states.values() else "succeeded"
+        b = build(build_id, version, list(chroot_states), state)
+        self.builds.append(b)
+        self.routes[b["source_package"]["url"]] = b"srpm"
+        self.routes[f"{COPR_API}/build-chroot/list/?build_id={build_id}"] = json.dumps(
+            {"items": [{"name": c, "state": s} for c, s in chroot_states.items()]}).encode()
+        for chroot, chroot_state in chroot_states.items():
+            if chroot_state == "succeeded":
+                self.add_chroot_results(b, chroot)
+        self.routes[BUILD_LIST_URL] = json.dumps({"items": self.builds}).encode()
+        chroots = self.project_chroots
+        if chroots is None:
+            chroots = sorted({c for b in self.builds for c in b["chroots"]})
+        self.routes[PROJECT_URL] = json.dumps({"chroot_repos": {c: f"{REPO_URL}/{c}/" for c in chroots}}).encode()
+        return b
 
     def chroot_dir(self, b, chroot):
         return f"{REPO_URL}/{chroot}/{b['id']:08d}-karellen-sysbox"
@@ -149,16 +168,14 @@ class CoprSite:
         del self.routes[self.redirects.get(url, url)]
 
     def new_build(self):
-        return json.loads(self.routes[f"{COPR_API}/build/list?ownername=karellen&projectname=karellen-sysbox"])[
-            "items"][1]
+        return next(b for b in self.builds if b["id"] == NEW_BUILD_ID)
 
     def running_first(self, times):
         """The new build is reported as running by the first `times` build list requests."""
-        url = f"{COPR_API}/build/list?ownername=karellen&projectname=karellen-sysbox"
-        finished = json.loads(self.routes[url])
-        running = json.loads(self.routes[url])
-        running["items"][1].update(state="running", ended_on=None)
-        self.routes[url] = [json.dumps(running).encode()] * times + [json.dumps(finished).encode()]
+        finished = json.loads(self.routes[BUILD_LIST_URL])
+        running = json.loads(self.routes[BUILD_LIST_URL])
+        next(b for b in running["items"] if b["id"] == NEW_BUILD_ID).update(state="running", ended_on=None)
+        self.routes[BUILD_LIST_URL] = [json.dumps(running).encode()] * times + [json.dumps(finished).encode()]
 
 
 class CoprToGhReleaseTest(unittest.TestCase):
@@ -313,9 +330,8 @@ class CoprToGhReleaseTest(unittest.TestCase):
         self.assertEqual(exit_code, 100)
         self.assertFalse(self.created(commands))
 
-    def test_chroot_that_did_not_succeed_is_not_required(self):
-        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "skipped",
-                         "epel-9-aarch64": "failed"})
+    def test_skipped_chroot_is_not_required(self):
+        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "skipped"})
 
         exit_code, commands = self.run_script(site)
 
@@ -324,6 +340,67 @@ class CoprToGhReleaseTest(unittest.TestCase):
             "fedora-44-karellen-sysbox-0.7.1.8-1.x86_64.rpm",
             "karellen-sysbox-0.7.1.8-1.src.rpm",
         ])
+
+    def test_partially_failed_build_is_aggregated_with_resubmission_of_same_version(self):
+        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "failed",
+                         "epel-9-x86_64": "succeeded", "epel-9-aarch64": "failed"})
+        site.add_build(NEW_BUILD_ID + 1, "0.7.1.8-1", {"fedora-44-aarch64": "succeeded", "epel-9-aarch64": "failed"})
+        site.add_build(NEW_BUILD_ID + 2, "0.7.1.8-1", {"epel-9-aarch64": "succeeded"})
+
+        exit_code, commands = self.run_script(site)
+
+        self.assertIn(exit_code, (0, None))
+        self.assertEqual(self.uploaded(commands), [
+            "epel-9-karellen-sysbox-0.7.1.8-1.aarch64.rpm",
+            "epel-9-karellen-sysbox-0.7.1.8-1.x86_64.rpm",
+            "fedora-44-karellen-sysbox-0.7.1.8-1.aarch64.rpm",
+            "fedora-44-karellen-sysbox-0.7.1.8-1.x86_64.rpm",
+            "karellen-sysbox-0.7.1.8-1.src.rpm",
+        ])
+
+    def test_failed_chroot_without_successful_resubmission_fails_without_releasing(self):
+        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "failed"})
+        site.add_build(NEW_BUILD_ID + 1, "0.7.1.8-1", {"fedora-44-aarch64": "failed", "epel-9-x86_64": "succeeded"})
+
+        exit_code, commands = self.run_script(site)
+
+        self.assertNotIn(exit_code, (0, None))
+        self.assertEqual(self.sleeps, [])
+        self.assertFalse(self.created(commands))
+        self.assertIsNone(self.uploaded(commands))
+
+    def test_failed_chroot_is_not_aggregated_from_another_version(self):
+        # 0.7.1.5-1 succeeded in fedora-44-aarch64, which must not stand in for 0.7.1.8-1
+        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "failed"})
+
+        exit_code, commands = self.run_script(site)
+
+        self.assertNotIn(exit_code, (0, None))
+        self.assertFalse(self.created(commands))
+        self.assertIsNone(self.uploaded(commands))
+
+    def test_failed_chroot_disabled_in_project_is_not_required(self):
+        site = CoprSite({"fedora-44-x86_64": "succeeded", "fedora-44-aarch64": "failed",
+                         "epel-9-x86_64": "succeeded"},
+                        project_chroots=["fedora-44-x86_64", "epel-9-x86_64", "epel-9-aarch64"])
+
+        exit_code, commands = self.run_script(site)
+
+        self.assertIn(exit_code, (0, None))
+        self.assertEqual(self.uploaded(commands), [
+            "epel-9-karellen-sysbox-0.7.1.8-1.x86_64.rpm",
+            "fedora-44-karellen-sysbox-0.7.1.8-1.x86_64.rpm",
+            "karellen-sysbox-0.7.1.8-1.src.rpm",
+        ])
+
+    def test_version_failed_in_every_chroot_fails_without_releasing(self):
+        site = CoprSite({"fedora-44-x86_64": "failed", "fedora-44-aarch64": "failed"})
+
+        exit_code, commands = self.run_script(site)
+
+        self.assertNotIn(exit_code, (0, None))
+        self.assertFalse(self.created(commands))
+        self.assertIsNone(self.uploaded(commands))
 
 
 if __name__ == "__main__":

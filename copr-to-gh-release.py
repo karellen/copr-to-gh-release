@@ -63,6 +63,28 @@ def main():
                             print(f"HTTP {r.status_code}: {url}")
                         return r.status_code == 200
 
+                chroot_states = {}
+
+                def get_chroot_state(build, platform_arch: str):
+                    if (build_id := build["id"]) not in chroot_states:
+                        with s.get("https://copr.fedorainfracloud.org/api_3/build-chroot/list/",
+                                   params={"build_id": build_id}) as r:
+                            r.raise_for_status()
+                            chroot_states[build_id] = {chroot["name"]: chroot["state"]
+                                                       for chroot in r.json().get("items", [])}
+                    return chroot_states[build_id].get(platform_arch)
+
+                def get_project_chroots():
+                    with s.get("https://copr.fedorainfracloud.org/api_3/project",
+                               params={"ownername": owner_name,
+                                       "projectname": project_name,
+                                       }) as r:
+                        r.raise_for_status()
+                        return set(r.json()["chroot_repos"])
+
+                # Chroots each version was built for (succeeded or failed) in any of its builds
+                version_built_chroots = {}
+
                 def get_builds():
                     build_metadata = {}
                     retry = True
@@ -76,9 +98,6 @@ def main():
                             builds = r.json().get("items", [])
 
                         for build in builds:
-                            if build["state"] == "failed":
-                                continue
-
                             if ((build_package_name := build["source_package"]["name"]) and
                                     build_package_name != package_name):
                                 continue
@@ -121,7 +140,19 @@ def main():
                                 continue
 
                             version_arches = build_metadata.setdefault(version, {})
+                            built_chroots = version_built_chroots.setdefault(version, set())
                             for arch in arches:
+                                if build["state"] != "succeeded":
+                                    # COPR builds are flaky: a build that failed in some chroots still provides
+                                    # the chroots it succeeded in, and a resubmission of the failed chroots
+                                    # provides the rest
+                                    chroot_state = get_chroot_state(bm, arch)
+                                    if chroot_state in ("succeeded", "failed"):
+                                        built_chroots.add(arch)
+                                    if chroot_state != "succeeded":
+                                        continue
+                                else:
+                                    built_chroots.add(arch)
                                 existing_bm = version_arches.setdefault(arch, bm)
                                 if existing_bm is bm:
                                     continue
@@ -152,17 +183,6 @@ def main():
                         else:
                             r.raise_for_status()
                         return r.json()["packages"]
-
-                chroot_states = {}
-
-                def get_chroot_state(build, platform_arch: str):
-                    if (build_id := build["id"]) not in chroot_states:
-                        with s.get("https://copr.fedorainfracloud.org/api_3/build-chroot/list/",
-                                   params={"build_id": build_id}) as r:
-                            r.raise_for_status()
-                            chroot_states[build_id] = {chroot["name"]: chroot["state"]
-                                                       for chroot in r.json().get("items", [])}
-                    return chroot_states[build_id].get(platform_arch)
 
                 def collect_version_files(k, build):
                     files = set()
@@ -198,6 +218,14 @@ def main():
                         version_files[k] = files
                     if missing:
                         version_missing[k] = missing
+
+                # Chroots a version was built for that did not succeed in any of that version's builds.
+                # Chroots no longer enabled in the COPR project are not required.
+                project_chroots = get_project_chroots()
+                version_unbuilt = {}
+                for k, built_chroots in version_built_chroots.items():
+                    if unbuilt := sorted((built_chroots & project_chroots) - build_metadata.get(k, {}).keys()):
+                        version_unbuilt[k] = unbuilt
 
                 def await_missing_files(rpm_version):
                     # Results of a build that has just finished may not be published to COPR storage yet
@@ -250,7 +278,7 @@ def main():
                     rpm_version = normalize_tag(current_tag)
                     print(f"tag {current_tag} maps to rpm version {rpm_version}")
 
-                    if not rpm_version in version_files:
+                    if not rpm_version in version_files and not rpm_version in version_unbuilt:
                         print(f"no asset files found for tag {current_tag} rpm version {rpm_version}")
                         if tag:
                             sys.exit(100)
@@ -263,6 +291,14 @@ def main():
                         if e.output and e.output.strip() != "release not found":
                             raise e
                         release_found = False
+
+                    if (not release_found or clobber_assets) and rpm_version in version_unbuilt:
+                        print(f"ERROR: not releasing tag {current_tag} rpm version {rpm_version}: no COPR build of "
+                              f"this version succeeded in chroots: {', '.join(version_unbuilt[rpm_version])}. "
+                              f"Resubmit them in COPR (or disable them in the COPR project) and re-run.",
+                              file=sys.stderr)
+                        failed_tags.append(current_tag)
+                        continue
 
                     if (not release_found or clobber_assets) and rpm_version in version_missing:
                         await_missing_files(rpm_version)
@@ -287,7 +323,8 @@ def main():
                         print(f"Release {current_tag} already exists and no '--clobber' is specified")
 
                 if failed_tags:
-                    print(f"ERROR: incomplete COPR assets, not released: {', '.join(failed_tags)}", file=sys.stderr)
+                    print(f"ERROR: incomplete COPR builds or assets, not released: {', '.join(failed_tags)}",
+                          file=sys.stderr)
                     sys.exit(1)
 
 
