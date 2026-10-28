@@ -32,7 +32,7 @@ parser.add_argument("--clobber-assets", required=False, action="store_true", def
                     help="for releases that already exist do clobber (re-upload) the assets")
 parser.add_argument("--no-ignore-epoch", dest="ignore_epoch", required=False, action="store_false", default=True,
                     help="ignore rpm epoch in version matches")
-parser.add_argument("--wait-build", required=False, action="store_true", default=True,
+parser.add_argument("--wait-build", required=False, action="store_true", default=False,
                     help="if we see pending or running builds we'll loop waiting for them to complete")
 
 
