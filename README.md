@@ -6,6 +6,15 @@ A GitHub Action that uploads COPR-generated RPM assets to GitHub Releases based 
 
 This action monitors [Fedora COPR](https://copr.fedorainfracloud.org/) builds for a given package, waits for them to complete, and uploads the resulting RPM artifacts as GitHub Release assets. It supports multi-architecture builds and can process individual tags or all tags in a repository.
 
+A release is never published with missing assets. Every RPM that a succeeded COPR chroot lists in its results must be downloadable; results of a just-finished build that are not published yet are re-checked every 30 seconds for up to 5 minutes. If any are still missing, that tag is not released (and existing releases are not clobbered) and the action fails. Chroots that did not succeed (failed, skipped, etc.) are not required. COPR download URLs that redirect (e.g. projects migrated to Pulp storage) are followed.
+
+## Testing
+
+```bash
+pip install requests
+python -m unittest -v
+```
+
 ## Usage
 
 ```yaml

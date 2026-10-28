@@ -11,6 +11,8 @@ from subprocess import check_output as run, check_call as exe, CalledProcessErro
 from time import sleep
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 parser = argparse.ArgumentParser(description="COPR to GH Release Synchronizer",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -46,12 +48,19 @@ def main():
     ignore_epoch = args.ignore_epoch
     wait_build = args.wait_build
     spin_loop_delay = 30
+    publish_wait_attempts = 10
 
     with ThreadPoolExecutor(max_workers=10) as tpe:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with (requests.Session() as s):
+                s.mount("https://", HTTPAdapter(max_retries=Retry(total=5, backoff_factor=2,
+                                                                  status_forcelist=(429, 500, 502, 503, 504))))
+
                 def check_url_exists(url):
-                    with s.head(url) as r:
+                    # COPR redirects results of projects migrated to Pulp storage
+                    with s.head(url, allow_redirects=True) as r:
+                        if r.status_code not in (200, 404):
+                            print(f"HTTP {r.status_code}: {url}")
                         return r.status_code == 200
 
                 def get_builds():
@@ -107,6 +116,8 @@ def main():
                                 "repo_url": build["repo_url"]
                             }
                             if not check_url_exists(bm["source_rpm"]):
+                                print(f"SRPM NOT FOUND: build id {build['id']} version {version}, "
+                                      f"skipping build: {bm['source_rpm']}")
                                 continue
 
                             version_arches = build_metadata.setdefault(version, {})
@@ -142,22 +153,64 @@ def main():
                             r.raise_for_status()
                         return r.json()["packages"]
 
-                version_files = {}
-                for k, build in build_metadata.items():
+                chroot_states = {}
+
+                def get_chroot_state(build, platform_arch: str):
+                    if (build_id := build["id"]) not in chroot_states:
+                        with s.get("https://copr.fedorainfracloud.org/api_3/build-chroot/list/",
+                                   params={"build_id": build_id}) as r:
+                            r.raise_for_status()
+                            chroot_states[build_id] = {chroot["name"]: chroot["state"]
+                                                       for chroot in r.json().get("items", [])}
+                    return chroot_states[build_id].get(platform_arch)
+
+                def collect_version_files(k, build):
                     files = set()
+                    missing = []
                     for arch in build:
                         arch_bm = build[arch]
                         files.add((basename(arch_bm["source_rpm"]), arch_bm["source_rpm"]))
+                        chroot_succeeded = get_chroot_state(arch_bm, arch) == "succeeded"
+                        binary_listed = False
                         for build_result in get_build_results(arch_bm, arch):
                             if build_result["arch"] == "src":
                                 continue
+                            binary_listed = True
                             file_name, url = get_arch_url(arch_bm, arch, build_result)
                             if check_url_exists(url):
                                 files.add((file_name, url))
                             else:
                                 print("NOT FOUND:", k, file_name, url)
+                                if chroot_succeeded:
+                                    missing.append(f"{arch}: {url}")
+                        if chroot_succeeded and not binary_listed:
+                            print("NO BINARY RPMS:", k, arch, get_build_dir_name(arch_bm, arch))
+                            missing.append(f"{arch}: no binary RPMs in {get_build_dir_name(arch_bm, arch)}")
+                    return files, missing
+
+                version_files = {}
+                # Assets a succeeded chroot produced that cannot be fetched. A version with any of these
+                # must not be released, or the release silently ends up incomplete.
+                version_missing = {}
+                for k, build in build_metadata.items():
+                    files, missing = collect_version_files(k, build)
                     if files:
                         version_files[k] = files
+                    if missing:
+                        version_missing[k] = missing
+
+                def await_missing_files(rpm_version):
+                    # Results of a build that has just finished may not be published to COPR storage yet
+                    for _ in range(publish_wait_attempts):
+                        print(f"{len(version_missing[rpm_version])} assets of rpm version {rpm_version} "
+                              f"cannot be fetched - will retry in {spin_loop_delay} seconds")
+                        sleep(spin_loop_delay)
+                        files, missing = collect_version_files(rpm_version, build_metadata[rpm_version])
+                        version_files[rpm_version] = files
+                        if not missing:
+                            del version_missing[rpm_version]
+                            return
+                        version_missing[rpm_version] = missing
 
                 if fetch_tags:
                     run(["git", "fetch", "--tags", "--force"])
@@ -190,6 +243,7 @@ def main():
                     return tpe.map(get_file, ((rpm_assets_dir, rpm_version, file_name, url)
                                               for file_name, url in version_files[rpm_version]))
 
+                failed_tags = []
                 for current_tag in get_tags():
                     print()
                     print(f"processing tag {current_tag}")
@@ -210,6 +264,17 @@ def main():
                             raise e
                         release_found = False
 
+                    if (not release_found or clobber_assets) and rpm_version in version_missing:
+                        await_missing_files(rpm_version)
+
+                    if (not release_found or clobber_assets) and rpm_version in version_missing:
+                        print(f"ERROR: not releasing tag {current_tag} rpm version {rpm_version}: "
+                              f"succeeded COPR chroots have assets that cannot be fetched:", file=sys.stderr)
+                        for entry in version_missing[rpm_version]:
+                            print(f"  {entry}", file=sys.stderr)
+                        failed_tags.append(current_tag)
+                        continue
+
                     if not release_found:
                         print(f"creating release for tag {current_tag}")
                         exe(["gh", "release", "create", current_tag, "--verify-tag", "--generate-notes"], text=True)
@@ -220,6 +285,10 @@ def main():
                         exe(["gh", "release", "upload", current_tag] + upload_files + ["--clobber"], text=True)
                     else:
                         print(f"Release {current_tag} already exists and no '--clobber' is specified")
+
+                if failed_tags:
+                    print(f"ERROR: incomplete COPR assets, not released: {', '.join(failed_tags)}", file=sys.stderr)
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
